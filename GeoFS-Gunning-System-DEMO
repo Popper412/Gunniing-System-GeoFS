@@ -1,0 +1,536 @@
+// ==UserScript==
+// @name         GeoFS Multiplayer Gunning System
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Multiplayer gunning system for GeoFS military jets
+// @author       GitHub Copilot
+// @match        https://www.geo-fs.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Multiplayer WebSocket setup
+    const WS_SERVER = "ws://localhost:8081"; // Change to your server address!
+    let ws;
+    function connectWS() {
+        ws = new WebSocket(WS_SERVER);
+        ws.onopen = () => console.log("Connected to GeoFS Gun Server");
+        ws.onclose = () => setTimeout(connectWS, 2000);
+        ws.onerror = () => ws.close();
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === "fire") {
+                    spawnRemoteBullet(data);
+                }
+            } catch (e) {}
+        };
+    }
+    // Optionally, call syncAmmo periodically or after firing/reloading
+    setInterval(updateAmmoBar, 100);
+    setInterval(syncAmmo, 500);
+
+    connectWS();
+
+    // List of military aircraft names in GeoFS
+    const militaryAircraft = [
+        "F-16", "F/A-18", "F-15", "F-22", "F-35", "Su-27", "MiG-29", "Eurofighter", "Rafale"
+    ];
+
+    function waitForGeoFS(callback) {
+        if (window.geoFs && geoFs.aircraft && geoFs.aircraft.instance) {
+            callback();
+        } else {
+            setTimeout(() => waitForGeoFS(callback), 1000);
+        }
+    }
+
+    waitForGeoFS(() => {
+        let bullets = [];
+        let remoteBullets = [];
+
+        function fireGun(isRemote, remoteData) {
+            const ac = geoFs.aircraft.instance;
+            const model = ac.model || {};
+            const name = (model.aircraftName || "").toUpperCase();
+
+            if (!militaryAircraft.some(type => name.includes(type.toUpperCase())) && !isRemote) {
+                return;
+            }
+
+            let pos, hdg, pitch;
+            if (isRemote && remoteData) {
+                pos = remoteData.pos;
+                hdg = remoteData.hdg;
+                pitch = remoteData.pitch;
+            } else {
+                pos = ac.getPosition();
+                hdg = ac.heading || 0;
+                pitch = ac.pitch || 0;
+            }
+
+            const radHdg = Cesium.Math.toRadians(hdg);
+            const radPitch = Cesium.Math.toRadians(pitch);
+            const speed = 900;
+
+            const dx = Math.cos(radPitch) * Math.sin(radHdg);
+            const dy = Math.sin(radPitch);
+            const dz = Math.cos(radPitch) * Math.cos(radHdg);
+
+            const bulletPos = {
+                longitude: pos.longitude + dx * 0.00001,
+                latitude: pos.latitude + dz * 0.00001,
+                altitude: pos.altitude + dy * 2
+            };
+
+            const color = isRemote ? Cesium.Color.RED : Cesium.Color.YELLOW;
+
+            const bulletEntity = geoFs.viewer.entities.add({
+                position: Cesium.Cartesian3.fromDegrees(
+                    bulletPos.longitude,
+                    bulletPos.latitude,
+                    bulletPos.altitude
+                ),
+                ellipsoid: {
+                    radii: new Cesium.Cartesian3(0.5, 0.5, 0.5),
+                    material: color
+                }
+            });
+
+            const bulletData = {
+                entity: bulletEntity,
+                lon: bulletPos.longitude,
+                lat: bulletPos.latitude,
+                alt: bulletPos.altitude,
+                dx, dy, dz,
+                time: Date.now()
+            };
+
+            if (isRemote) {
+                remoteBullets.push(bulletData);
+            } else {
+                bullets.push(bulletData);
+                // Broadcast to others
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "fire",
+                        pos: pos,
+                        hdg: hdg,
+                        pitch: pitch
+                    }));
+                }
+            }
+        }
+
+        function spawnRemoteBullet(data) {
+            fireGun(true, data);
+        }
+
+        // Use LMB to fire
+        window.addEventListener("mousedown", function(e) {
+            if (e.button === 0) {
+                fireGun();
+            }
+        });
+
+        // Update bullets every frame
+        setInterval(() => {
+            const dt = 0.05;
+            const speed = 900;
+            const remove = [];
+            bullets.forEach((b, i) => {
+                b.lon += b.dx * speed * dt * 1e-5;
+                b.lat += b.dz * speed * dt * 1e-5;
+                b.alt += b.dy * speed * dt;
+                b.entity.position = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, b.alt);
+                if (Date.now() - b.time > 3000 || b.alt < 0) {
+                    geoFs.viewer.entities.remove(b.entity);
+                    remove.push(i);
+                }
+            });
+            for (let i = remove.length - 1; i >= 0; i--) {
+                bullets.splice(remove[i], 1);
+            }
+
+            // Remote bullets
+            const removeRemote = [];
+            remoteBullets.forEach((b, i) => {
+                b.lon += b.dx * speed * dt * 1e-5;
+                b.lat += b.dz * speed * dt * 1e-5;
+                b.alt += b.dy * speed * dt;
+                b.entity.position = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, b.alt);
+                if (Date.now() - b.time > 3000 || b.alt < 0) {
+                    geoFs.viewer.entities.remove(b.entity);
+                    removeRemote.push(i);
+                }
+            });
+            for (let i = removeRemote.length - 1; i >= 0; i--) {
+                remoteBullets.splice(removeRemote[i], 1);
+            }
+        }, 50);
+
+        console.log("GeoFS Multiplayer Gunning System loaded! LMB to fire (military jets only).");
+    });
+})();
+// This script is a simple multiplayer gunning system for GeoFS military jets.
+// It allows players to fire bullets  and see them in the game world.
+// The bullets are represented as small ellipsoids and are removed after a certain time or when they hit the ground.
+// The script uses WebSocket to communicate with a server for multiplayer functionality.
+// The server address should be changed to the actual server address.
+// The script also includes a list of military aircraft names to filter which aircraft can fire bullets.
+// The bullets are fired in the direction the aircraft is facing and are affected by gravity.
+// The script uses Cesium for 3D rendering and GeoFS for the game environment.
+// The script is designed to be used with Tampermonkey or similar user script managers.
+// The script is self-contained and does not require any external libraries or dependencies.
+// The script is designed to be easy to understand and modify for further development.
+// (Removed duplicate health bar UI and health variable declaration)
+
+function updateHealthBar() {
+    const inner = document.getElementById('geofs-health-inner');
+    const text = document.getElementById('geofs-health-text');
+    inner.style.width = Math.max(0, health) + '%';
+    text.textContent = `${Math.max(0, Math.round(health))} HP`;
+}
+updateHealthBar();
+// Simple hit detection: check if any remote bullet is close to your aircraft
+function checkBulletHits() {
+    const ac = geoFs.aircraft.instance;
+    const pos = ac.getPosition();
+    remoteBullets.forEach((b, i) => {
+        // Only check if bullet is "alive"
+        if (!b.hit && b.alt > 0) {
+            // Calculate distance (rough, not geodesic)
+            const dLon = (b.lon - pos.longitude) * 111320 * Math.cos(pos.latitude * Math.PI / 180);
+            const dLat = (b.lat - pos.latitude) * 110540;
+            const dAlt = (b.alt - pos.altitude);
+            const dist = Math.sqrt(dLon * dLon + dLat * dLat + dAlt * dAlt);
+            if (dist < 30) { // 30 meters hit radius
+                b.hit = true;
+                health -= 10;
+                updateHealthBar();
+                // Optional: flash effect
+                healthBar.style.boxShadow = '0 0 20px 5px #f00';
+                setTimeout(() => healthBar.style.boxShadow = '', 200);
+                if (health <= 0) {
+                    health = 0;
+                    updateHealthBar();
+                    alert("You have been shot down!");
+                    // Optional: respawn or reload
+                }
+            }
+        }
+    });
+}
+checkBulletHits();
+// Inside checkBulletHits(), after health -= 10 and updateHealthBar();
+if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+        type: "hp",
+        hp: health
+    }));
+}
+ws.onmessage = function(event) {
+    try {
+        const data = JSON.parse(event.data);
+        if (data.type === "fire") {
+            spawnRemoteBullet(data);
+        } else if (data.type === "hp" && typeof data.hp === "number") {
+            // Optionally show other players' HP (for now, just log)
+            console.log("Another player's HP:", data.hp);
+            // You could display this in a multiplayer UI if desired
+        } else if (data.type === "ammo" && typeof data.ammo === "number") {
+            // Optionally show other players' ammo/reload (for now, just log)
+            console.log("Another player's ammo:", data.ammo, "Reloading:", data.isReloading);
+            // You could display this in a multiplayer UI if desired
+        }
+    } catch (e) {}
+};
+const militaryPlanes = {
+    "F-16": {
+        displayName: "F-16 Fighting Falcon",
+        hp: 100,
+        color: Cesium.Color.YELLOW,
+        gunType: "M61A1 Vulcan 20mm",
+        hitbox: { length: 15, width: 10, height: 5 }
+    },
+    "F/A-18F": {
+        displayName: "F/A-18F Super Hornet",
+        hp: 100,
+        color: Cesium.Color.CYAN,
+        gunType: "M61A2 Vulcan 20mm",
+        hitbox: { length: 18, width: 13, height: 5 }
+    },
+    "F-15C": {
+        displayName: "F-15C Eagle",
+        hp: 100,
+        color: Cesium.Color.ORANGE,
+        gunType: "M61A1 Vulcan 20mm",
+        hitbox: { length: 19, width: 13, height: 5 }
+    },
+    "F-22": {
+        displayName: "F-22 Raptor",
+        hp: 100,
+        color: Cesium.Color.LIME,
+        gunType: "M61A2 Vulcan 20mm",
+        hitbox: { length: 19, width: 13.5, height: 5 }
+    },
+    "F-35B": {
+        displayName: "F-35B Lightning II",
+        hp: 100,
+        color: Cesium.Color.PURPLE,
+        gunType: "GAU-22/A 25mm",
+        hitbox: { length: 15.5, width: 10.7, height: 5 }
+    },
+    "Su-35": {
+        displayName: "Su-35 Flanker-E",
+        hp: 100,
+        color: Cesium.Color.BLUE,
+        gunType: "GSh-30-1 30mm",
+        hitbox: { length: 22, width: 15.3, height: 5.5 }
+    },
+    "Rafale": {
+        displayName: "Dassault Rafale",
+        hp: 100,
+        color: Cesium.Color.WHITE,
+        gunType: "GIAT 30M791 30mm",
+        hitbox: { length: 15.3, width: 10.9, height: 5 }
+    },
+    "A-10": {
+        displayName: "A-10 Warthog",
+        hp: 100,
+        color: Cesium.Color.GRAY,
+        gunType: "GAU-8/A Avenger 30mm",
+        hitbox: { length: 16.3, width: 17.5, height: 5.2 }
+    },
+    "F-14B": {
+        displayName: "F-14B Tomcat",
+        hp: 100,
+        color: Cesium.Color.SANDYBROWN,
+        gunType: "M61A1 Vulcan 20mm",
+        hitbox: { length: 19, width: 19.5, height: 5.2 }
+    }
+};function checkBulletHits() {
+    const ac = geoFs.aircraft.instance;
+    const pos = ac.getPosition();
+    const type = getCurrentMilitaryPlaneType();
+    const box = (type && militaryPlanes[type] && militaryPlanes[type].hitbox)
+        ? militaryPlanes[type].hitbox
+        : { length: 18, width: 13, height: 5 }; // fallback
+
+    // Convert aircraft position to Cartesian for easier math
+    const acCart = Cesium.Cartesian3.fromDegrees(pos.longitude, pos.latitude, pos.altitude);
+
+    remoteBullets.forEach((b, i) => {
+        if (!b.hit && b.alt > 0) {
+            // Bullet position in Cartesian
+            const bulletCart = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, b.alt);
+
+            // Compute offset vector
+            const offset = Cesium.Cartesian3.subtract(bulletCart, acCart, new Cesium.Cartesian3());
+
+            // Get aircraft heading in radians
+            const hdg = (ac.heading || 0) * Math.PI / 180;
+            const cosH = Math.cos(-hdg);
+            const sinH = Math.sin(-hdg);
+
+            // Rotate offset vector to align with aircraft local axes (approximate)
+            const localX =  cosH * offset.x - sinH * offset.y;
+            const localY =  sinH * offset.x + cosH * offset.y;
+            const localZ = offset.z;
+
+            // Check if within hitbox bounds
+            if (
+                Math.abs(localX) < box.length / 2 &&
+                Math.abs(localY) < box.width / 2 &&
+                Math.abs(localZ) < box.height / 2
+            ) {
+                b.hit = true;
+                health -= 10;
+                updateHealthBar();
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "hp",
+                        hp: health
+                    }));
+                }
+                healthBar.style.boxShadow = '0 0 20px 5px #f00';
+                setTimeout(() => healthBar.style.boxShadow = '', 200);
+                if (health <= 0) {
+                    health = 0;
+                    updateHealthBar();
+                    alert("You have been shot down!");
+                }
+            }
+        }
+    });
+}
+
+const type = getCurrentMilitaryPlaneType();
+if (type && militaryPlanes[type]) {
+    const gun = militaryPlanes[type].gunType;
+    // Use gun variable as needed
+}
+function getCurrentMilitaryPlaneType() {
+    const ac = geoFs.aircraft.instance;
+    const model = ac.model || {};
+    const name = (model.aircraftName || "").toUpperCase();
+    for (const type in militaryPlanes) {
+        if (name.includes(type.replace(/-/g, "").toUpperCase())) {
+            return type;
+        }
+    }
+    return null;
+}
+// Add a button to toggle the health bar
+// ...existing code...
+
+// Create health bar UI
+let health = 100;
+const healthBar = document.createElement('div');
+healthBar.style.position = 'fixed';
+healthBar.style.top = '20px';
+healthBar.style.left = '50%';
+healthBar.style.transform = 'translateX(-50%)';
+healthBar.style.width = '220px';
+healthBar.style.height = '28px';
+healthBar.style.background = '#222';
+healthBar.style.border = '2px solid #fff';
+healthBar.style.zIndex = 9999;
+healthBar.innerHTML = `
+  <div id="geofs-health-inner" style="
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, #0f0, #ff0, #f00);
+    transition: width 0.2s;
+  "></div>
+  <span id="geofs-health-text" style="
+    position: absolute; left: 0; right: 0; top: 0; bottom: 0;
+    color: #fff; text-align: center; line-height: 28px; font-weight: bold;
+    text-shadow: 1px 1px 2px #000;
+  ">100 HP</span>
+`;
+document.body.appendChild(healthBar);
+
+// --- Add a button to toggle the health bar ---
+const toggleBtn = document.createElement('button');
+toggleBtn.textContent = "Toggle Health Bar";
+toggleBtn.style.position = 'fixed';
+toggleBtn.style.top = '55px';
+toggleBtn.style.left = '50%';
+toggleBtn.style.transform = 'translateX(-50%)';
+toggleBtn.style.zIndex = 10000;
+toggleBtn.style.padding = '6px 16px';
+toggleBtn.style.background = '#333';
+toggleBtn.style.color = '#fff';
+toggleBtn.style.border = '1px solid #fff';
+toggleBtn.style.borderRadius = '6px';
+toggleBtn.style.cursor = 'pointer';
+toggleBtn.onclick = () => {
+    healthBar.style.display = (healthBar.style.display === 'none') ? 'block' : 'none';
+};
+document.body.appendChild(toggleBtn);
+// Gunfire sound (short burst, royalty-free)
+// You can use your own .mp3/.wav URL if you want a different sound
+const gunSound = new Audio("https://cdn.jsdelivr.net/gh/napthedev/public@main/mg.wav");
+gunSound.volume = 0.4;
+let ammo = 100;
+let isReloading = false;
+const maxAmmo = 100;
+const reloadTime = 2000; // ms
+function fireGun(isRemote, remoteData) {
+    // ...existing code...
+
+    // Only play sound and use ammo for local shots
+    if (!isRemote) {
+        if (isReloading) return;
+        if (ammo <= 0) {
+            // Optional: play empty click sound
+            return;
+        }
+        ammo--;
+        gunSound.currentTime = 0;
+        gunSound.play();
+    }
+
+    // ...rest of fireGun code...
+}
+// --- Add a button to reload ---
+const reloadBtn = document.createElement('button');
+reloadBtn.textContent = "Reload";
+reloadBtn.style.position = 'fixed';
+reloadBtn.style.top = '90px';
+reloadBtn.style.left = '50%';
+reloadBtn.style.transform = 'translateX(-50%)';
+reloadBtn.style.zIndex = 10000;
+reloadBtn.style.padding = '6px 16px';
+reloadBtn.style.background = '#333';
+reloadBtn.style.color = '#fff';
+reloadBtn.style.border = '1px solid #fff';
+reloadBtn.style.borderRadius = '6px';
+reloadBtn.style.cursor = 'pointer';
+reloadBtn.onclick = () => {
+    if (!isReloading && ammo < maxAmmo) {
+        isReloading = true;
+        reloadBtn.textContent = "Reloading...";
+        setTimeout(() => {
+            ammo = maxAmmo;
+            isReloading = false;
+            reloadBtn.textContent = "Reload";
+        }, reloadTime);
+    }
+};
+document.body.appendChild(reloadBtn);
+const ammoBar = document.createElement('div');
+ammoBar.style.position = 'fixed';
+ammoBar.style.top = '20px';
+ammoBar.style.left = 'calc(50% + 130px)';
+ammoBar.style.color = '#fff';
+ammoBar.style.fontWeight = 'bold';
+ammoBar.style.fontSize = '18px';
+ammoBar.style.textShadow = '1px 1px 2px #000';
+ammoBar.style.zIndex = 9999;
+ammoBar.textContent = `Ammo: ${ammo}/${maxAmmo}`;
+document.body.appendChild(ammoBar);
+
+function updateAmmoBar() {
+    ammoBar.textContent = `Ammo: ${ammo}/${maxAmmo}`;
+}
+// ...existing code...
+
+// Hotkey: Press 'K' to reload
+window.addEventListener('keydown', function(e) {
+    if (e.key.toLowerCase() === 'k') {
+        if (!isReloading && ammo < maxAmmo) {
+            isReloading = true;
+            reloadBtn.textContent = "Reloading...";
+            setTimeout(() => {
+                ammo = maxAmmo;
+                isReloading = false;
+                reloadBtn.textContent = "Reload";
+                updateAmmoBar();
+            }, reloadTime);
+        }
+    }
+});
+function syncAmmo() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: "ammo",
+            ammo: ammo,
+            isReloading: isReloading
+        }));
+    }
+}
+ammo--;
+updateAmmoBar();
+syncAmmo();
+isReloading = true;
+reloadBtn.textContent = "Reloading...";
+syncAmmo();
+ammo = maxAmmo;
+isReloading = false;
+reloadBtn.textContent = "Reload";
+updateAmmoBar();
+syncAmmo();
